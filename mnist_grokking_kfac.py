@@ -126,10 +126,10 @@ class LinearKFACAccumulator:
         self.G: Optional[torch.Tensor] = None
         self.n: int = 0
         self._activations: Optional[torch.Tensor] = None
-        self._handle_fwd = layer.register_forward_hook(self._forward_hook)
+        self._handle_fwd = layer.register_forward_pre_hook(self._forward_hook)
         self._handle_bwd = layer.register_full_backward_hook(self._backward_hook)
 
-    def _forward_hook(self, _: nn.Module, inputs: Tuple[torch.Tensor, ...], __: torch.Tensor) -> None:
+    def _forward_hook(self, _: nn.Module, inputs: Tuple[torch.Tensor, ...]) -> None:
         a = inputs[0].detach()
         if a.dim() > 2:
             a = a.reshape(-1, a.size(-1))
@@ -155,10 +155,9 @@ class LinearKFACAccumulator:
             d_out = g.size(-1)
             self.A = torch.zeros(d_in, d_in, dtype=a.dtype, device=a.device)
             self.G = torch.zeros(d_out, d_out, dtype=g.dtype, device=g.device)
-        batch_size = max(a.size(0), 1)
-        self.A.add_((a.T @ a) / batch_size)
-        self.G.add_((g.T @ g) / batch_size)
-        self.n += 1
+        self.A.add_(a.T @ a)
+        self.G.add_(g.T @ g)
+        self.n += a.size(0)
         self._activations = None
 
     def compute_metrics(self, damping: float = 1e-6) -> Dict[str, float]:
@@ -182,7 +181,7 @@ class LinearKFACAccumulator:
             "G_fro": float(torch.linalg.norm(G_avg, ord="fro").item()),
             "A_condition": float((eig_A.max() / eig_A.min()).item()),
             "G_condition": float((eig_G.max() / eig_G.min()).item()),
-            "batches": float(self.n),
+            "samples": float(self.n),
         }
         return metrics
 
