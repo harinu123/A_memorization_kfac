@@ -36,6 +36,7 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float64
 SEED = 0
 NUM_CLASSES = 10
+KEEP_MASS = 0.8
 
 
 torch.set_default_dtype(DTYPE)
@@ -185,6 +186,28 @@ class LinearKFACAccumulator:
         }
         return metrics
 
+    def compute_results(
+        self,
+        damping: float = 1e-6,
+        weight: Optional[torch.Tensor] = None,
+        keep_mass: float = KEEP_MASS,
+    ) -> Tuple[Dict[str, float], Optional[torch.Tensor], Optional[torch.Tensor], Optional[Dict[str, float]]]:
+        metrics = self.compute_metrics(damping=damping)
+        if not metrics:
+            return metrics, None, None, None
+        A_avg = (self.A / self.n).detach().cpu()
+        G_avg = (self.G / self.n).detach().cpu()
+        decomposition = None
+        if weight is not None:
+            shared, memorized, info = decompose_weight_with_kfac(weight.detach().cpu(), A_avg, G_avg, keep_mass)
+            decomposition = {
+                "shared_fro": float(torch.linalg.norm(shared, ord="fro").item()),
+                "memorized_fro": float(torch.linalg.norm(memorized, ord="fro").item()),
+                "kept_mass": info["kept_mass"],
+                "pairs_kept": info["pairs_kept"],
+            }
+        return metrics, A_avg, G_avg, decomposition
+
     def close(self) -> None:
         self._handle_fwd.remove()
         self._handle_bwd.remove()
@@ -198,7 +221,10 @@ def collect_kfac_statistics(
     loss_fn: nn.Module,
     loss_type: str,
     damping: float = 1e-6,
-) -> Dict[str, Dict[str, float]]:
+    keep_mass: float = KEEP_MASS,
+    return_factors: bool = False,
+    compute_decomposition: bool = False,
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, torch.Tensor]], Dict[str, Dict[str, float]]]:
     collectors: Dict[str, LinearKFACAccumulator] = {}
     try:
         for name, module in model.named_modules():
@@ -218,14 +244,57 @@ def collect_kfac_statistics(
                 raise ValueError(f"Unsupported loss function: {loss_type}")
             loss.backward()
 
-        kfac_stats = {
-            name: collector.compute_metrics(damping=damping) for name, collector in collectors.items()
-        }
+        kfac_stats: Dict[str, Dict[str, float]] = {}
+        kfac_factors: Dict[str, Dict[str, torch.Tensor]] = {}
+        kfac_decompositions: Dict[str, Dict[str, float]] = {}
+        for name, collector in collectors.items():
+            weight = collector.layer.weight if compute_decomposition else None
+            metrics, A_avg, G_avg, decomposition = collector.compute_results(
+                damping=damping,
+                weight=weight,
+                keep_mass=keep_mass,
+            )
+            kfac_stats[name] = metrics
+            if return_factors and A_avg is not None and G_avg is not None:
+                kfac_factors[name] = {"A": A_avg, "G": G_avg}
+            if decomposition is not None:
+                kfac_decompositions[name] = decomposition
     finally:
         for collector in collectors.values():
             collector.close()
         model.zero_grad(set_to_none=True)
-    return kfac_stats
+    return kfac_stats, kfac_factors, kfac_decompositions
+
+
+def decompose_weight_with_kfac(
+    weight: torch.Tensor, A: torch.Tensor, G: torch.Tensor, keep_mass: float
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    eig_A, Q_A = torch.linalg.eigh(A)
+    eig_G, Q_G = torch.linalg.eigh(G)
+    kron_eigs = torch.outer(eig_G, eig_A).reshape(-1)
+    total_mass = torch.sum(kron_eigs).item()
+    sorted_idx = torch.argsort(kron_eigs, descending=True)
+    cumulative = torch.cumsum(kron_eigs[sorted_idx], dim=0)
+    keep_count = int((cumulative / max(total_mass, 1e-12) <= keep_mass).sum().item())
+    if keep_count == 0:
+        keep_count = 1
+    selected = sorted_idx[:keep_count]
+    num_a = eig_A.numel()
+    g_indices = selected // num_a
+    a_indices = selected % num_a
+
+    weight_basis = Q_G.T @ weight @ Q_A
+    mask = torch.zeros_like(weight_basis)
+    mask[g_indices, a_indices] = 1.0
+    shared_basis = weight_basis * mask
+    memorized_basis = weight_basis - shared_basis
+
+    shared = Q_G @ shared_basis @ Q_A.T
+    memorized = Q_G @ memorized_basis @ Q_A.T
+
+    kept_mass = float(cumulative[keep_count - 1].item() / max(total_mass, 1e-12))
+    info = {"kept_mass": kept_mass, "pairs_kept": float(keep_count)}
+    return shared, memorized, info
 
 
 # ------------------------------
@@ -294,6 +363,38 @@ optimizer_instance = optimizer_cls(model.parameters(), lr=LEARNING_RATE, weight_
 loss_fn = LOSS_FUNCTION_DICT[LOSS_FUNCTION]()
 
 torch.save(model.state_dict(), f"model_initial_10m_{EXPERIMENT}.pth")
+save_kfac_checkpoint(
+    "initial",
+    model,
+    fixed_train_inputs,
+    fixed_train_labels,
+    loss_fn,
+    LOSS_FUNCTION,
+)
+
+
+def save_kfac_checkpoint(
+    tag: str,
+    model: nn.Module,
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    loss_fn: nn.Module,
+    loss_type: str,
+    keep_mass: float = KEEP_MASS,
+) -> None:
+    kfac_stats, kfac_factors, kfac_decompositions = collect_kfac_statistics(
+        model,
+        inputs,
+        labels,
+        loss_fn,
+        loss_type,
+        keep_mass=keep_mass,
+        return_factors=True,
+        compute_decomposition=True,
+    )
+    checkpoint = {"stats": kfac_stats, "factors": kfac_factors, "decomposition": kfac_decompositions}
+    kfac_checkpoints[tag] = checkpoint
+    torch.save(checkpoint, f"kfac_checkpoint_{tag}_10m_{EXPERIMENT}.pt")
 
 
 # ------------------------------
@@ -314,6 +415,10 @@ ww_steps: List[int] = []
 ww_dfs: List[pd.DataFrame] = []
 
 kfac_records: List[Dict[str, float]] = []
+kfac_decomposition_records: List[Dict[str, float]] = []
+
+kfac_checkpoints: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {}
+
 
 best_test_acc = -1.0
 one_hots = torch.eye(NUM_CLASSES, NUM_CLASSES, device=DEVICE)
@@ -344,6 +449,14 @@ with torch.autograd.set_detect_anomaly(False):
             if test_acc > best_test_acc:
                 best_test_acc = test_acc
                 torch.save(model.state_dict(), f"model_best_test_acc_10m_{EXPERIMENT}.pth")
+                save_kfac_checkpoint(
+                    "best",
+                    model,
+                    fixed_train_inputs,
+                    fixed_train_labels,
+                    loss_fn,
+                    LOSS_FUNCTION,
+                )
 
             with torch.no_grad():
                 total_norm = sum(torch.pow(param, 2).sum() for param in model.parameters())
@@ -376,12 +489,14 @@ with torch.autograd.set_detect_anomaly(False):
             ww_spectrals.append(avg_spectral)
             ww_steps.append(steps)
 
-            kfac_stats = collect_kfac_statistics(
+            kfac_stats, _, kfac_decompositions = collect_kfac_statistics(
                 model,
                 fixed_train_inputs,
                 fixed_train_labels,
                 loss_fn,
                 LOSS_FUNCTION,
+                keep_mass=KEEP_MASS,
+                compute_decomposition=True,
             )
             for layer_name, metrics in kfac_stats.items():
                 if not metrics:
@@ -389,6 +504,11 @@ with torch.autograd.set_detect_anomaly(False):
                 record = {"step": steps, "layer": layer_name}
                 record.update(metrics)
                 kfac_records.append(record)
+                if layer_name in kfac_decompositions:
+                    decomp = kfac_decompositions[layer_name]
+                    decomp_record = {"step": steps, "layer": layer_name}
+                    decomp_record.update(decomp)
+                    kfac_decomposition_records.append(decomp_record)
 
         optimizer_instance.zero_grad(set_to_none=True)
         outputs = model(inputs.to(DEVICE))
@@ -404,6 +524,14 @@ with torch.autograd.set_detect_anomaly(False):
 
 
 torch.save(model.state_dict(), f"model_final_10m_{EXPERIMENT}.pth")
+save_kfac_checkpoint(
+    "final",
+    model,
+    fixed_train_inputs,
+    fixed_train_labels,
+    loss_fn,
+    LOSS_FUNCTION,
+)
 
 
 # ------------------------------
@@ -430,3 +558,8 @@ progress_df.to_csv(f"training_history_10m_{EXPERIMENT}.csv", index=False)
 
 kfac_df = pd.DataFrame(kfac_records)
 kfac_df.to_csv(f"kfac_statistics_10m_{EXPERIMENT}.csv", index=False)
+
+kfac_decomposition_df = pd.DataFrame(kfac_decomposition_records)
+kfac_decomposition_df.to_csv(
+    f"kfac_decomposition_10m_{EXPERIMENT}.csv", index=False
+)
