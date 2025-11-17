@@ -297,6 +297,39 @@ def decompose_weight_with_kfac(
     return shared, memorized, info
 
 
+def save_kfac_checkpoint(
+    tag: str,
+    model: nn.Module,
+    inputs: torch.Tensor,
+    labels: torch.Tensor,
+    loss_fn: nn.Module,
+    loss_type: str,
+    keep_mass: float = KEEP_MASS,
+) -> None:
+    kfac_stats, kfac_factors, kfac_decompositions = collect_kfac_statistics(
+        model,
+        inputs,
+        labels,
+        loss_fn,
+        loss_type,
+        keep_mass=keep_mass,
+        return_factors=True,
+        compute_decomposition=True,
+    )
+    checkpoint = {
+        "state_dict": model.state_dict(),
+        "kfac_stats": kfac_stats,
+        "kfac_factors": kfac_factors,
+        "kfac_decompositions": kfac_decompositions,
+        "tag": tag,
+    }
+    global kfac_checkpoints  # noqa: PLW0603 - shared logging container
+    if "kfac_checkpoints" not in globals():
+        kfac_checkpoints = {}
+    kfac_checkpoints[tag] = checkpoint
+    torch.save(checkpoint, f"kfac_checkpoint_{tag}_10m_{EXPERIMENT}.pt")
+
+
 # ------------------------------
 # Metrics helpers
 # ------------------------------
@@ -362,6 +395,8 @@ optimizer_cls = OPTIMIZER_DICT[OPTIMIZER]
 optimizer_instance = optimizer_cls(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 loss_fn = LOSS_FUNCTION_DICT[LOSS_FUNCTION]()
 
+kfac_checkpoints: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {}
+
 torch.save(model.state_dict(), f"model_initial_10m_{EXPERIMENT}.pth")
 save_kfac_checkpoint(
     "initial",
@@ -371,30 +406,6 @@ save_kfac_checkpoint(
     loss_fn,
     LOSS_FUNCTION,
 )
-
-
-def save_kfac_checkpoint(
-    tag: str,
-    model: nn.Module,
-    inputs: torch.Tensor,
-    labels: torch.Tensor,
-    loss_fn: nn.Module,
-    loss_type: str,
-    keep_mass: float = KEEP_MASS,
-) -> None:
-    kfac_stats, kfac_factors, kfac_decompositions = collect_kfac_statistics(
-        model,
-        inputs,
-        labels,
-        loss_fn,
-        loss_type,
-        keep_mass=keep_mass,
-        return_factors=True,
-        compute_decomposition=True,
-    )
-    checkpoint = {"stats": kfac_stats, "factors": kfac_factors, "decomposition": kfac_decompositions}
-    kfac_checkpoints[tag] = checkpoint
-    torch.save(checkpoint, f"kfac_checkpoint_{tag}_10m_{EXPERIMENT}.pt")
 
 
 # ------------------------------
@@ -416,8 +427,6 @@ ww_dfs: List[pd.DataFrame] = []
 
 kfac_records: List[Dict[str, float]] = []
 kfac_decomposition_records: List[Dict[str, float]] = []
-
-kfac_checkpoints: Dict[str, Dict[str, Dict[str, torch.Tensor]]] = {}
 
 
 best_test_acc = -1.0
