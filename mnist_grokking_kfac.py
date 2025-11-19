@@ -164,14 +164,14 @@ class LinearKFACAccumulator:
     def compute_metrics(self, damping: float = 1e-6) -> Dict[str, float]:
         if self.n == 0 or self.A is None or self.G is None:
             return {}
-        A_avg = (self.A / self.n).detach().cpu()
-        G_avg = (self.G / self.n).detach().cpu()
+        A_avg = _symmetrize((self.A / self.n).detach().cpu())
+        G_avg = _symmetrize((self.G / self.n).detach().cpu())
 
-        A_eye = torch.eye(A_avg.size(0), dtype=A_avg.dtype)
-        G_eye = torch.eye(G_avg.size(0), dtype=G_avg.dtype)
+        eig_A, _, used_damping_A = stabilized_eigh(A_avg, damping=damping)
+        eig_G, _, used_damping_G = stabilized_eigh(G_avg, damping=damping)
 
-        eig_A = torch.linalg.eigvalsh(A_avg + damping * A_eye)
-        eig_G = torch.linalg.eigvalsh(G_avg + damping * G_eye)
+        if eig_A is None or eig_G is None:
+            return {"samples": float(self.n), "eigh_failed": 1.0}
 
         metrics = {
             "A_trace": float(torch.trace(A_avg).item()),
@@ -183,6 +183,9 @@ class LinearKFACAccumulator:
             "A_condition": float((eig_A.max() / eig_A.min()).item()),
             "G_condition": float((eig_G.max() / eig_G.min()).item()),
             "samples": float(self.n),
+            "eigh_failed": 0.0,
+            "damping_A_used": float(used_damping_A),
+            "damping_G_used": float(used_damping_G),
         }
         return metrics
 
@@ -195,8 +198,8 @@ class LinearKFACAccumulator:
         metrics = self.compute_metrics(damping=damping)
         if not metrics:
             return metrics, None, None, None
-        A_avg = (self.A / self.n).detach().cpu()
-        G_avg = (self.G / self.n).detach().cpu()
+        A_avg = _symmetrize((self.A / self.n).detach().cpu())
+        G_avg = _symmetrize((self.G / self.n).detach().cpu())
         decomposition = None
         if weight is not None:
             shared, memorized, info = decompose_weight_with_kfac(weight.detach().cpu(), A_avg, G_avg, keep_mass)
@@ -205,6 +208,9 @@ class LinearKFACAccumulator:
                 "memorized_fro": float(torch.linalg.norm(memorized, ord="fro").item()),
                 "kept_mass": info["kept_mass"],
                 "pairs_kept": info["pairs_kept"],
+                "damping_A": info.get("damping_A", damping),
+                "damping_G": info.get("damping_G", damping),
+                "eigh_failed": info.get("eigh_failed", 0.0),
             }
         return metrics, A_avg, G_avg, decomposition
 
@@ -266,11 +272,41 @@ def collect_kfac_statistics(
     return kfac_stats, kfac_factors, kfac_decompositions
 
 
+def _symmetrize(matrix: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (matrix + matrix.T)
+
+
+def stabilized_eigh(
+    matrix: torch.Tensor, damping: float = 1e-6, max_retries: int = 5, growth: float = 10.0
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], float]:
+    sym_matrix = _symmetrize(matrix)
+    eye = torch.eye(sym_matrix.size(0), dtype=sym_matrix.dtype, device=sym_matrix.device)
+    trial_damping = damping
+    for _ in range(max_retries):
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(sym_matrix + trial_damping * eye)
+            return eigvals, eigvecs, trial_damping
+        except torch.linalg.LinAlgError:
+            trial_damping *= growth
+    return None, None, trial_damping
+
+
 def decompose_weight_with_kfac(
     weight: torch.Tensor, A: torch.Tensor, G: torch.Tensor, keep_mass: float
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
-    eig_A, Q_A = torch.linalg.eigh(A)
-    eig_G, Q_G = torch.linalg.eigh(G)
+    eig_A, Q_A, damp_A = stabilized_eigh(A)
+    eig_G, Q_G, damp_G = stabilized_eigh(G)
+
+    if eig_A is None or eig_G is None or Q_A is None or Q_G is None:
+        info = {
+            "kept_mass": 0.0,
+            "pairs_kept": 0.0,
+            "damping_A": float(damp_A),
+            "damping_G": float(damp_G),
+            "eigh_failed": 1.0,
+        }
+        return torch.zeros_like(weight), weight.clone(), info
+
     kron_eigs = torch.outer(eig_G, eig_A).reshape(-1)
     total_mass = torch.sum(kron_eigs).item()
     sorted_idx = torch.argsort(kron_eigs, descending=True)
@@ -293,7 +329,13 @@ def decompose_weight_with_kfac(
     memorized = Q_G @ memorized_basis @ Q_A.T
 
     kept_mass = float(cumulative[keep_count - 1].item() / max(total_mass, 1e-12))
-    info = {"kept_mass": kept_mass, "pairs_kept": float(keep_count)}
+    info = {
+        "kept_mass": kept_mass,
+        "pairs_kept": float(keep_count),
+        "damping_A": float(damp_A),
+        "damping_G": float(damp_G),
+        "eigh_failed": 0.0,
+    }
     return shared, memorized, info
 
 
